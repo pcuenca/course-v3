@@ -14,7 +14,11 @@ Deploying a model in SageMaker is a three-step process:
 
 For more information on how models are deployed to Amazon SageMaker checkout the documentation [here](https://docs.aws.amazon.com/sagemaker/latest/dg/ex1-deploy-model.html).
 
-We will be using the [Amazon SageMaker Python SDK](https://sagemaker.readthedocs.io/en/stable/) which makes this easy.
+We will be using the [Amazon SageMaker Python SDK](https://sagemaker.readthedocs.io/en/stable/) which makes this easy and automates a few of the steps.
+
+## Pricing
+
+Sagemaker deployment pricing information can be found [here](https://aws.amazon.com/sagemaker/pricing/). In short: you pay an hourly rate depending on the instance type that you choose. Be careful because this can add up fast - for instance, the smallest P3 instance costs >$2000/month. Also note that the AWS free tier only provides enough hours to run an m4.xlarge instance for 5 days.
 
 ## Setup your SageMaker notebook instance
 
@@ -32,7 +36,7 @@ Create a Jupyter notebook on your SageMaker notebook instance for your project t
 
 An example based on the pets lesson 1 exercise is the following:
 
-```
+```python
 from fastai.vision import *
 path = untar_data(URLs.PETS)
 path_img = path/'images'
@@ -42,8 +46,6 @@ bs=64
 data = ImageDataBunch.from_name_re(path_img, fnames, pat, ds_tfms=get_transforms(),
                                    size=299, bs=bs//2).normalize(imagenet_stats)
 learn = create_cnn(data, models.resnet50, metrics=error_rate)
-learn.lr_find()
-learn.recorder.plot()
 learn.fit_one_cycle(8)
 learn.unfreeze()
 learn.fit_one_cycle(3, max_lr=slice(1e-6,1e-4))
@@ -53,7 +55,7 @@ learn.fit_one_cycle(3, max_lr=slice(1e-6,1e-4))
 
 Now that you have trained your `learn` object you can export the `data` object and save the model weights with the following commands:
 
-```
+```python
 data.export()
 learn.save('resnet50')
 ```
@@ -62,7 +64,7 @@ learn.save('resnet50')
 
 Now we have exported our model artefacts we can zip them up and upload to S3.
 
-```
+```python
 import tarfile
 with tarfile.open(path_img/'models/model.tar.gz', 'w:gz') as f:
     t = tarfile.TarInfo('models')
@@ -74,7 +76,7 @@ with tarfile.open(path_img/'models/model.tar.gz', 'w:gz') as f:
 
 Now we can upload them to S3 with the following commands. 
 
-```
+```python
 import sagemaker
 from sagemaker.utils import name_from_base
 sagemaker_session = sagemaker.Session()
@@ -99,26 +101,16 @@ The methods `input_fn` and `input_fn` are optional and if obmitted SageMaker wil
 
 An example script to serve a vision resnet model can be found below:
 
-```
-import logging
-import requests
-
-import os
-import io
-import glob
-import time
-
+```python
+import logging, requests, os, io, glob, time
 from fastai.vision import *
 
-# setup logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-# set the constants for the content types
 JSON_CONTENT_TYPE = 'application/json'
 JPEG_CONTENT_TYPE = 'image/jpeg'
 
-# Load the fast.ai model
 def model_fn(model_dir):
     logger.info('model_fn')
     path = Path(model_dir)
@@ -134,14 +126,11 @@ def model_fn(model_dir):
 def input_fn(request_body, content_type=JPEG_CONTENT_TYPE):
     logger.info('Deserializing the input data.')
     # process an image uploaded to the endpoint
-    if content_type == JPEG_CONTENT_TYPE:
-        img = open_image(io.BytesIO(request_body))
-        return img
+    if content_type == JPEG_CONTENT_TYPE: return open_image(io.BytesIO(request_body))
     # process a URL submitted to the endpoint
     if content_type == JSON_CONTENT_TYPE:
         img_request = requests.get(request_body['url'], stream=True)
-        img = open_image(io.BytesIO(img_request.content))
-        return img        
+        return open_image(io.BytesIO(img_request.content))
     raise Exception('Requested unsupported ContentType in content_type: {}'.format(content_type))
 
 # Perform prediction on the deserialized object, with the loaded model
@@ -152,17 +141,13 @@ def predict_fn(input_object, model):
     print("--- Inference time: %s seconds ---" % (time.time() - start_time))
     print(f'Predicted class is {str(predict_class)}')
     print(f'Predict confidence score is {predict_values[predict_idx.item()].item()}')
-    response = {}
-    response['class'] = str(predict_class)
-    response['confidence'] = predict_values[predict_idx.item()].item()
-    return response
+    return dict(class = str(predict_class),
+        confidence = predict_values[predict_idx.item()].item())
 
 # Serialize the prediction result into the desired response content type
 def output_fn(prediction, accept=JSON_CONTENT_TYPE):        
     logger.info('Serializing the generated output.')
-    if accept == JSON_CONTENT_TYPE:
-        output = json.dumps(prediction)
-        return output, accept
+    if accept == JSON_CONTENT_TYPE: return json.dumps(prediction), accept
     raise Exception('Requested unsupported ContentType in Accept: {}'.format(accept))    
 ```
 
@@ -172,31 +157,26 @@ Save the script into a python such as `serve.py`
 
 First we need to create a RealTimePredictor class to accept jpeg images as input and output JSON. The default behaviour is to accept a numpy array.
 
-```
+```python
 class ImagePredictor(RealTimePredictor):
     def __init__(self, endpoint_name, sagemaker_session):
-        super(ImagePredictor, self).__init__(endpoint_name, sagemaker_session=sagemaker_session, serializer=None, 
-                                            deserializer=json_deserializer, content_type='image/jpeg')
+        super().__init__(endpoint_name, sagemaker_session=sagemaker_session, serializer=None, 
+                         deserializer=json_deserializer, content_type='image/jpeg')
 ```
 
 We need to get the IAM role ARN to give SageMaker permissions to read our model artefact from S3.
 
-```
+```python
 role = sagemaker.get_execution_role()
 ```
 
-In this example we will deploy our model to the instance type `ml.c5.large`. We will pass in the name of our serving script e.g. `serve.py`. We will also pass in the S3 path of our model that we uploaded earlier.
+In this example we will deploy our model to the instance type `ml.m4.xlarge`. We will pass in the name of our serving script e.g. `serve.py`. We will also pass in the S3 path of our model that we uploaded earlier.
 
-```
-model=PyTorchModel(model_data=model_artefact,
-                        name=name_from_base("fastai-pets-model"),
-                        role=role,
-                        framework_version='1.0.0',
-                        entry_point='serve.py',
-                        predictor_cls=ImagePredictor)
+```python
+model=PyTorchModel(model_data=model_artefact, name=name_from_base("fastai-pets-model"),
+    role=role, framework_version='1.0.0', entry_point='serve.py', predictor_cls=ImagePredictor)
 
-predictor = model.deploy(initial_instance_count=1,
-                         instance_type='ml.c5.large')
+predictor = model.deploy(initial_instance_count=1, instance_type='ml.m4.xlarge')
 ```
 
 It will take a while for SageMaker to provision the endpoint ready for inference. 
@@ -206,7 +186,7 @@ It will take a while for SageMaker to provision the endpoint ready for inference
 
 Now you can make inference calls against the deployed endpoint with a call such as:
 
-```
+```python
 url = <some url of an image to test>
 img_bytes = requests.get(url).content
 predictor.predict(img_bytes); response
@@ -215,11 +195,9 @@ predictor.predict(img_bytes); response
 ## Local testing
 In case you want to test the endpoint before deploying to SageMaker you can run the following `deploy` command changing the parameter name `instance_type` value to `local`.
 
-```
-predictor = model.deploy(initial_instance_count=1,
-                         instance_type='local')
+```python
+predictor = model.deploy(initial_instance_count=1, instance_type='local')
 ```
 
 You can call the `predictor.predict()` the same as earlier but it will call the local endpoint.
 
----
